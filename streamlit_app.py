@@ -1,6 +1,8 @@
 import streamlit as st
 from datetime import datetime, date, timedelta
 import plotly.graph_objects as go
+import openpyxl
+import math
 
 st.set_page_config(
     page_title="新生児管理チェックリスト",
@@ -8,11 +10,460 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("👶 新生児管理チェックリスト")
+st.title("新生児管理チェックリスト")
 st.markdown("---")
 
-# 全ての基準値を定義（グローバル変数として定義）
-ALL_PHOTOTHERAPY_THRESHOLDS = {
+st.markdown(
+    """
+<style>
+div[role=\"radiogroup\"] {
+  display: flex;
+  gap: 0.5rem;
+}
+div[role=\"radiogroup\"] > label {
+  border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 12px;
+  padding: 0.35rem 0.75rem;
+  margin: 0 !important;
+  background: rgba(255,255,255,0.03);
+}
+div[role=\"radiogroup\"] > label:has(input:checked) {
+  border-color: rgba(255,255,255,0.40);
+  background: rgba(255,255,255,0.12);
+}
+div[role=\"radiogroup\"] > label > div {
+  gap: 0.25rem;
+}
+div[role=\"radiogroup\"] svg {
+  display: none;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+ICON_AABR = "👂"
+ICON_MRI = "🧠"
+ICON_EYE = "👁️"
+ICON_THYROID = "🦋"
+ICON_HYPOGLYCEMIA = "🩸"
+ICON_JAUNDICE = "💡"
+
+
+def lms_to_value(L, M, S, z):
+    if L is None or M is None or S is None:
+        return None
+    if L == 0:
+        return M * (2.718281828459045 ** (S * z))
+    return M * ((1 + L * S * z) ** (1 / L))
+
+
+def value_to_lms_z(L, M, S, value):
+    if L is None or M is None or S is None or value is None:
+        return None
+    if value <= 0 or M <= 0 or S == 0:
+        return None
+    if L == 0:
+        return math.log(value / M) / S
+    return (((value / M) ** L) - 1) / (L * S)
+
+
+def z_to_percentile(z):
+    if z is None:
+        return None
+    return 50.0 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+@st.cache_data(show_spinner=False)
+def load_taikaku_birth_lms(path):
+    wb = openpyxl.load_workbook(path, data_only=True)
+    sheet_name = wb.sheetnames[7]
+    sh = wb[sheet_name]
+
+    rows = {}
+    last_week = None
+    for r in range(7, sh.max_row + 1):
+        week = sh.cell(r, 2).value
+        day = sh.cell(r, 3).value
+        if week is None:
+            week = last_week
+        if week is None or day is None:
+            continue
+
+        last_week = int(week)
+
+        key = (int(week), int(day))
+        rows[key] = {
+            "maleFB_w": (sh.cell(r, 4).value, sh.cell(r, 5).value, sh.cell(r, 6).value),
+            "maleSB_w": (sh.cell(r, 10).value, sh.cell(r, 11).value, sh.cell(r, 12).value),
+            "femaleFB_w": (sh.cell(r, 16).value, sh.cell(r, 17).value, sh.cell(r, 18).value),
+            "femaleSB_w": (sh.cell(r, 22).value, sh.cell(r, 23).value, sh.cell(r, 24).value),
+            "birthH": (sh.cell(r, 34).value, sh.cell(r, 35).value, sh.cell(r, 36).value),
+        }
+
+    return rows
+
+
+def get_birth_size_thresholds(taikaku_rows, gender, is_first_child_bool, gestational_weeks, gestational_days):
+    key = (int(gestational_weeks), int(gestational_days))
+    row = taikaku_rows.get(key)
+    if row is None:
+        key = (int(gestational_weeks), 0)
+        row = taikaku_rows.get(key)
+    if row is None:
+        w = int(gestational_weeks)
+        for dw in range(1, 8):
+            row = taikaku_rows.get((w - dw, 0))
+            if row is not None:
+                break
+            row = taikaku_rows.get((w + dw, 0))
+            if row is not None:
+                break
+    if row is None:
+        return None
+
+    if gender == "男児":
+        weight_key = "maleFB_w" if is_first_child_bool else "maleSB_w"
+    else:
+        weight_key = "femaleFB_w" if is_first_child_bool else "femaleSB_w"
+
+    wL, wM, wS = row[weight_key]
+    hL, hM, hS = row["birthH"]
+
+    z10 = -1.281551565545
+    z90 = 1.281551565545
+    z_minus2 = -2.0
+
+    return {
+        "weight_p10_g": lms_to_value(wL, wM, wS, z10),
+        "weight_p90_g": lms_to_value(wL, wM, wS, z90),
+        "weight_minus2sd_g": lms_to_value(wL, wM, wS, z_minus2),
+        "height_p10_cm": lms_to_value(hL, hM, hS, z10),
+        "height_p90_cm": lms_to_value(hL, hM, hS, z90),
+        "height_minus2sd_cm": lms_to_value(hL, hM, hS, z_minus2),
+        "weight_lms": (wL, wM, wS),
+        "height_lms": (hL, hM, hS),
+    }
+
+
+def build_birth_size_plane_fig(birth_weight_g, birth_length_cm, thresholds):
+    if thresholds is None:
+        return None
+
+    wx1 = thresholds.get("weight_minus2sd_g")
+    wx2 = thresholds.get("weight_p10_g")
+    wx3 = thresholds.get("weight_p90_g")
+    hy1 = thresholds.get("height_minus2sd_cm")
+    hy2 = thresholds.get("height_p10_cm")
+    hy3 = thresholds.get("height_p90_cm")
+
+    if None in (wx1, wx2, wx3, hy1, hy2, hy3):
+        return None
+
+    # 16領域：
+    # - 体重：-2SD/10/90%ileで4区分
+    # - 身長：-2SD/10/90%ileで4区分
+    x_cuts = [wx1, wx2, wx3]
+    y_cuts = [hy1, hy2, hy3]
+
+    def bin_index(value, cuts):
+        # cuts: [c0, c1, ...]
+        for i, c in enumerate(cuts):
+            if value < c:
+                return i
+        return len(cuts)
+
+    xi = bin_index(birth_weight_g, x_cuts) if birth_weight_g is not None else 1
+    yi = bin_index(birth_length_cm, y_cuts) if birth_length_cm is not None else 1
+
+    # 表示範囲は「閾値と本児の周辺」にトリミングして見やすく
+    if birth_weight_g is None:
+        x_min = x_cuts[0] * 0.90
+        x_max = x_cuts[-1] * 1.12
+    else:
+        x_min = min(birth_weight_g, x_cuts[0]) * 0.90
+        x_max = max(birth_weight_g, x_cuts[-1]) * 1.12
+
+    if birth_length_cm is None:
+        y_min = y_cuts[0] * 0.98
+        y_max = y_cuts[-1] * 1.04
+    else:
+        y_min = min(birth_length_cm, y_cuts[0]) * 0.98
+        y_max = max(birth_length_cm, y_cuts[-1]) * 1.04
+
+    x_edges = [x_min, x_cuts[0], x_cuts[1], x_cuts[2], x_max]
+    y_edges = [y_min, y_cuts[0], y_cuts[1], y_cuts[2], y_max]
+
+    x0, x1 = x_edges[xi], x_edges[xi + 1]
+    y0, y1 = y_edges[yi], y_edges[yi + 1]
+
+    fig = go.Figure()
+
+    # 5分類の塗り分け（重なりが起きないように定義）
+    # - HFD/LGA: 体重 > 90%ile
+    # - AGA: 体重 10〜90%ile
+    # - LFD: 体重 < 10%ile かつ 身長 >= 10%ile
+    # - SGA: 体重 < 10%ile かつ 身長 < 10%ile
+    # - SGA(GH): SGAのうち (体重 < -2SD または 身長 < -2SD)
+
+    # HFD/LGA（右側帯）
+    fig.add_shape(
+        type="rect",
+        x0=wx3,
+        x1=x_edges[-1],
+        y0=y_edges[0],
+        y1=y_edges[-1],
+        fillcolor="rgba(255, 120, 180, 0.14)",
+        line=dict(color="rgba(255, 120, 180, 0.0)", width=0),
+        layer="below",
+    )
+
+    # AGA（中央帯）はニュートラル：背景塗りはしない
+
+    # 左側（体重<10%ile）を身長で分割：上=LFD、下=SGA（このあとSGA(GH)で一部上書き）
+    # LFD（体重<10%ileの帯全体を指す概念。SGAを内包する）
+    fig.add_shape(
+        type="rect",
+        x0=x_edges[0],
+        x1=wx2,
+        y0=y_edges[0],
+        y1=y_edges[-1],
+        fillcolor="rgba(255, 220, 120, 0.08)",
+        line=dict(color="rgba(255, 220, 120, 0.0)", width=0),
+        layer="below",
+    )
+
+    # SGA（ベース）: LFD帯のうち身長<10%ileの部分
+    fig.add_shape(
+        type="rect",
+        x0=x_edges[0],
+        x1=wx2,
+        y0=y_edges[0],
+        y1=hy2,
+        fillcolor="rgba(110, 230, 160, 0.12)",
+        line=dict(color="rgba(110, 230, 160, 0.0)", width=0),
+        layer="below",
+    )
+
+    # SGA(GH)（SGAのうちL字領域）：SGAより強い同系色
+    # - 左列：体重<-2SD & 身長<10%ile
+    fig.add_shape(
+        type="rect",
+        x0=x_edges[0],
+        x1=wx1,
+        y0=y_edges[0],
+        y1=hy2,
+        fillcolor="rgba(110, 230, 160, 0.28)",
+        line=dict(color="rgba(110, 230, 160, 0.0)", width=0),
+        layer="below",
+    )
+    # - 下段：身長<-2SD & 体重が -2SD〜10%ile
+    fig.add_shape(
+        type="rect",
+        x0=wx1,
+        x1=wx2,
+        y0=y_edges[0],
+        y1=hy1,
+        fillcolor="rgba(110, 230, 160, 0.28)",
+        line=dict(color="rgba(110, 230, 160, 0.0)", width=0),
+        layer="below",
+    )
+
+    # エリア内ラベル
+    def mid(a, b):
+        return a + (b - a) * 0.5
+
+    label_font = dict(size=12, color="rgba(255,255,255,0.80)")
+    box_bg = "rgba(0,0,0,0.22)"
+
+    fig.add_annotation(
+        x=mid(wx3, x_edges[-1]),
+        y=mid(hy2, y_edges[-1]),
+        text="HFD / LGA",
+        showarrow=False,
+        font=label_font,
+        bgcolor=box_bg,
+    )
+    fig.add_annotation(
+        x=mid(wx2, wx3),
+        y=mid(hy2, y_edges[-1]),
+        text="AGA",
+        showarrow=False,
+        font=label_font,
+        bgcolor=box_bg,
+    )
+    fig.add_annotation(
+        x=mid(x_edges[0], wx2),
+        y=mid(hy2, y_edges[-1]),
+        text="LFD",
+        showarrow=False,
+        font=label_font,
+        bgcolor=box_bg,
+    )
+    fig.add_annotation(
+        x=mid(wx1, wx2),
+        y=mid(hy1, hy2),
+        text="SGA",
+        showarrow=False,
+        font=label_font,
+        bgcolor=box_bg,
+    )
+    fig.add_annotation(
+        x=mid(x_edges[0], wx1),
+        y=mid(y_edges[0], hy1),
+        text="SGA (GH)",
+        showarrow=False,
+        font=label_font,
+        bgcolor=box_bg,
+    )
+
+    line_color = "rgba(255,255,255,0.35)"
+    label_color = "rgba(255,255,255,0.70)"
+    dash_dot = "dot"
+
+    # 線の近くにラベルを配置（凡例は使わない）
+    y_label = y_edges[0] + (y_edges[-1] - y_edges[0]) * 0.03
+    x_label = x_edges[0] + (x_edges[-1] - x_edges[0]) * 0.02
+
+    for x, label, dash in [
+        (wx1, f"体重 -2SD ({wx1:.0f}g)", dash_dot),
+        (wx2, f"体重 10%ile ({wx2:.0f}g)", None),
+        (wx3, f"体重 90%ile ({wx3:.0f}g)", None),
+    ]:
+        fig.add_shape(
+            type="line",
+            x0=x,
+            x1=x,
+            y0=y_edges[0],
+            y1=y_edges[-1],
+            line=dict(color=line_color, width=1, dash=dash),
+            layer="below",
+        )
+        fig.add_annotation(
+            x=x,
+            y=y_label,
+            text=label,
+            showarrow=False,
+            textangle=90,
+            xanchor="left",
+            yanchor="bottom",
+            font=dict(size=11, color=label_color),
+            bgcolor="rgba(0,0,0,0.25)",
+        )
+
+    for y, label, dash in [
+        (hy1, f"身長 -2SD ({hy1:.1f}cm)", dash_dot),
+        (hy2, f"身長 10%ile ({hy2:.1f}cm)", None),
+        (hy3, f"身長 90%ile ({hy3:.1f}cm)", None),
+    ]:
+        fig.add_shape(
+            type="line",
+            x0=x_edges[0],
+            x1=x_edges[-1],
+            y0=y,
+            y1=y,
+            line=dict(color=line_color, width=1, dash=dash),
+            layer="below",
+        )
+        fig.add_annotation(
+            x=x_label,
+            y=y,
+            text=label,
+            showarrow=False,
+            xanchor="left",
+            yanchor="bottom",
+            font=dict(size=11, color=label_color),
+            bgcolor="rgba(0,0,0,0.25)",
+        )
+
+    if birth_length_cm is None and birth_weight_g is not None:
+        wL, wM, wS = thresholds.get("weight_lms", (None, None, None))
+        w_z = value_to_lms_z(wL, wM, wS, birth_weight_g)
+        w_p = z_to_percentile(w_z)
+        w_z_text = "-" if w_z is None else f"{w_z:+.2f}SD"
+        w_p_text = "-" if w_p is None else f"{w_p:.1f}%ile"
+
+        fig.add_shape(
+            type="line",
+            x0=birth_weight_g,
+            x1=birth_weight_g,
+            y0=y_edges[0],
+            y1=y_edges[-1],
+            line=dict(color="rgba(255, 77, 77, 0.9)", width=3.5),
+            layer="above",
+        )
+        fig.add_annotation(
+            x=birth_weight_g,
+            y=y_edges[-1],
+            text=f"{birth_weight_g:.0f}g",
+            showarrow=False,
+            yanchor="bottom",
+            xanchor="center",
+            font=dict(size=11, color="rgba(255,255,255,0.8)"),
+            bgcolor="rgba(0,0,0,0.25)",
+        )
+
+    if birth_weight_g is None and birth_length_cm is not None:
+        fig.add_shape(
+            type="line",
+            x0=x_edges[0],
+            x1=x_edges[-1],
+            y0=birth_length_cm,
+            y1=birth_length_cm,
+            line=dict(color="rgba(255, 77, 77, 0.9)", width=3.5),
+            layer="above",
+        )
+        fig.add_annotation(
+            x=x_edges[-1],
+            y=birth_length_cm,
+            text=f"{birth_length_cm:.1f}cm",
+            showarrow=False,
+            yanchor="bottom",
+            xanchor="right",
+            font=dict(size=11, color="rgba(255,255,255,0.8)"),
+            bgcolor="rgba(0,0,0,0.25)",
+        )
+
+    if birth_length_cm is not None and birth_weight_g is not None:
+        wL, wM, wS = thresholds.get("weight_lms", (None, None, None))
+        hL, hM, hS = thresholds.get("height_lms", (None, None, None))
+        w_z = value_to_lms_z(wL, wM, wS, birth_weight_g)
+        w_p = z_to_percentile(w_z)
+        h_z = value_to_lms_z(hL, hM, hS, birth_length_cm)
+        h_p = z_to_percentile(h_z)
+        w_z_text = "-" if w_z is None else f"{w_z:+.2f}SD"
+        w_p_text = "-" if w_p is None else f"{w_p:.1f}%ile"
+        h_z_text = "-" if h_z is None else f"{h_z:+.2f}SD"
+        h_p_text = "-" if h_p is None else f"{h_p:.1f}%ile"
+
+        fig.add_trace(
+            go.Scatter(
+                x=[birth_weight_g],
+                y=[birth_length_cm],
+                mode="markers+text",
+                text=[f"{birth_weight_g:.0f}g {birth_length_cm:.1f}cm"],
+                textposition="top center",
+                marker=dict(size=12, color="#ff4d4d", line=dict(color="rgba(0,0,0,0.5)", width=1)),
+                hovertemplate="体重=%{x:.0f}g<br>身長=%{y:.1f}cm<extra></extra>",
+                showlegend=False,
+            )
+        )
+
+
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_title="出生体重 (g)",
+        yaxis_title="出生身長 (cm)",
+        template="plotly_dark",
+        height=380,
+        showlegend=False,
+    )
+    fig.update_xaxes(range=[x_edges[0], x_edges[-1]])
+    fig.update_yaxes(range=[y_edges[0], y_edges[-1]])
+    return fig
+
+# 村田基準の基準値（グローバル変数として定義）
+MURATA_PHOTOTHERAPY_THRESHOLDS = {
     "≥ 2,500g": {
         0: 11.0, 1: 12.0, 2: 15.0, 3: 17.0,
         4: 18.0, 5: 19.0, 6: 19.5, 7: 20.0
@@ -35,8 +486,246 @@ ALL_PHOTOTHERAPY_THRESHOLDS = {
     }
 }
 
+MORIOKA_TB_THRESHOLDS = {
+    (22, 25): {
+        24: (5, 6, 8),
+        48: (5, 8, 10),
+        72: (5, 8, 12),
+        96: (6, 9, 13),
+        120: (7, 10, 13),
+        float("inf"): (8, 10, 13),
+    },
+    (26, 27): {
+        24: (5, 6, 8),
+        48: (5, 9, 10),
+        72: (6, 9, 12),
+        96: (8, 11, 14),
+        120: (9, 12, 15),
+        float("inf"): (10, 12, 15),
+    },
+    (28, 29): {
+        24: (6, 7, 9),
+        48: (7, 10, 12),
+        72: (8, 12, 14),
+        96: (10, 13, 16),
+        120: (11, 14, 18),
+        float("inf"): (12, 14, 18),
+    },
+    (30, 31): {
+        24: (7, 8, 10),
+        48: (8, 12, 14),
+        72: (10, 14, 16),
+        96: (12, 15, 18),
+        120: (13, 16, 20),
+        float("inf"): (14, 16, 20),
+    },
+    (32, 34): {
+        24: (8, 9, 10),
+        48: (10, 14, 16),
+        72: (12, 16, 18),
+        96: (14, 18, 20),
+        120: (15, 19, 22),
+        float("inf"): (16, 19, 22),
+    },
+    (35, float("inf")): {
+        24: (10, 11, 12),
+        48: (12, 16, 18),
+        72: (14, 18, 20),
+        96: (16, 20, 22),
+        120: (17, 22, 25),
+        float("inf"): (18, 22, 25),
+    },
+}
+
+MORIOKA_UB_THRESHOLDS = {
+    (22, 25): (0.4, 0.6, 0.8),
+    (26, 27): (0.4, 0.6, 0.8),
+    (28, 29): (0.5, 0.7, 0.9),
+    (30, 31): (0.6, 0.8, 1.0),
+    (32, 34): (0.7, 0.9, 1.2),
+    (35, float("inf")): (0.8, 1.0, 1.5),
+}
+
+
+def get_morioka_thresholds(pca_weeks, hours_old):
+    if pca_weeks is None or hours_old is None:
+        return None
+
+    pca_w = int(pca_weeks)
+    group = None
+    for (low, high) in MORIOKA_TB_THRESHOLDS.keys():
+        if low <= pca_w <= high:
+            group = (low, high)
+            break
+    if group is None:
+        return None
+
+    tb_bucket = None
+    for upper_h in sorted(MORIOKA_TB_THRESHOLDS[group].keys(), key=lambda x: float(x)):
+        if hours_old < upper_h:
+            tb_bucket = upper_h
+            break
+    if tb_bucket is None:
+        tb_bucket = float("inf")
+
+    tb_low, tb_high, tb_exchange = MORIOKA_TB_THRESHOLDS[group][tb_bucket]
+    ub_low, ub_high, ub_exchange = MORIOKA_UB_THRESHOLDS[group]
+
+    if tb_bucket == float("inf"):
+        time_label = "120時間以上"
+    else:
+        time_label = f"{int(tb_bucket)}時間未満"
+
+    return {
+        "pca_group": group,
+        "time_bucket_hours": tb_bucket,
+        "time_label": time_label,
+        "tb": {"low": tb_low, "high": tb_high, "exchange": tb_exchange},
+        "ub": {"low": ub_low, "high": ub_high, "exchange": ub_exchange},
+    }
+
+
+def build_morioka_html_table(
+    current_pca_group=None,
+    current_time_bucket_hours=None,
+    highlight_pairs=None,
+):
+    time_buckets = [24, 48, 72, 96, 120, float("inf")]
+    time_labels = {
+        24: "<24h",
+        48: "<48h",
+        72: "<72h",
+        96: "<96h",
+        120: "<120h",
+        float("inf"): "120h-",
+    }
+
+    table_style = "border-collapse:collapse;width:100%;font-size:14px"
+    th_style = "text-align:center;padding:6px 8px;border:1px solid #333;background:#1b1b1b;color:#eaeaea;white-space:nowrap"
+    th_left_style = "text-align:left;padding:6px 8px;border:1px solid #333;background:#1b1b1b;color:#eaeaea;white-space:nowrap"
+    td_style = "padding:6px 8px;border:1px solid #333;background:#0f0f0f;color:#eaeaea;text-align:center"
+
+    if highlight_pairs is None:
+        highlight_pairs = set()
+
+    rows = []
+    for (pca_low, pca_high), tb_by_bucket in MORIOKA_TB_THRESHOLDS.items():
+        if pca_high == float("inf"):
+            pca_label = f"{pca_low}w-"
+        else:
+            pca_label = f"{pca_low}-{pca_high}w"
+
+        ub_low, ub_high, ub_ex = MORIOKA_UB_THRESHOLDS[(pca_low, pca_high)]
+        ub_cell = f"{ub_low}/{ub_high}/{ub_ex}"
+
+        row_cells = []
+        for b in time_buckets:
+            low, high, ex = tb_by_bucket[b]
+            cell = f"{low}/{high}/{ex}"
+            is_cell_hit = (current_pca_group == (pca_low, pca_high) and current_time_bucket_hours == b)
+            style = td_style
+            is_soft_hit = ((pca_low, pca_high), b) in highlight_pairs
+            if is_soft_hit:
+                style = style + ";background:rgba(255, 238, 186, 0.18)"
+            if is_cell_hit:
+                style = style + ";background:#ffeeba;color:#111;font-weight:800"
+            row_cells.append(f"<td style='{style}'>{cell}</td>")
+
+        is_row_hit = (current_pca_group == (pca_low, pca_high))
+        row_style = ""
+        if is_row_hit:
+            row_style = "background:#141414"
+
+        ub_td_style = td_style
+        if is_row_hit:
+            ub_td_style = ub_td_style + ";background:#ffeeba;color:#111;font-weight:800"
+
+        rows.append(
+            "<tr style='" + row_style + "'>"
+            + f"<th style='{th_left_style}'>{pca_label}</th>"
+            + "".join(row_cells)
+            + f"<td style='{ub_td_style}'>{ub_cell}</td>"
+            + "</tr>"
+        )
+
+    header = (
+        "<tr>"
+        f"<th style='{th_left_style}'>修正週数</th>"
+        + "".join(
+            [
+                f"<th style='{th_style}'>{time_labels[b]}</th>"
+                for b in time_buckets
+            ]
+        )
+        + f"<th style='{th_style}'>UB（µg/dL）</th>"
+        + "</tr>"
+    )
+
+    return (
+        "<div style='overflow-x:auto'>"
+        f"<table style='{table_style}'>"
+        + header
+        + "".join(rows)
+        + "</table>"
+        "</div>"
+    )
+
+
+def get_morioka_pca_group_from_weeks(pca_weeks):
+    if pca_weeks is None:
+        return None
+    w = int(pca_weeks)
+    for (low, high) in MORIOKA_TB_THRESHOLDS.keys():
+        if low <= w <= high:
+            return (low, high)
+    return None
+
+
+def build_morioka_ub_html_table(current_pca_group=None):
+    table_style = "border-collapse:collapse;width:100%;font-size:14px"
+    th_style = "text-align:center;padding:6px 8px;border:1px solid #333;background:#1b1b1b;color:#eaeaea;white-space:nowrap"
+    th_left_style = "text-align:left;padding:6px 8px;border:1px solid #333;background:#1b1b1b;color:#eaeaea;white-space:nowrap"
+    td_style = "padding:6px 8px;border:1px solid #333;background:#0f0f0f;color:#eaeaea;text-align:center"
+
+    header = (
+        "<tr>"
+        f"<th style='{th_left_style}'>修正週数</th>"
+        f"<th style='{th_style}'>low</th>"
+        f"<th style='{th_style}'>high</th>"
+        f"<th style='{th_style}'>交換輸血</th>"
+        "</tr>"
+    )
+
+    rows = []
+    for (pca_low, pca_high), (ub_low, ub_high, ub_ex) in MORIOKA_UB_THRESHOLDS.items():
+        if pca_high == float("inf"):
+            pca_label = f"{pca_low}w-"
+        else:
+            pca_label = f"{pca_low}-{pca_high}w"
+
+        is_row_hit = (current_pca_group == (pca_low, pca_high))
+        hit_td_style = td_style + ";background:#ffeeba;color:#111;font-weight:800" if is_row_hit else td_style
+
+        rows.append(
+            "<tr>"
+            + f"<th style='{th_left_style}'>{pca_label}</th>"
+            + f"<td style='{hit_td_style}'>{ub_low}</td>"
+            + f"<td style='{hit_td_style}'>{ub_high}</td>"
+            + f"<td style='{hit_td_style}'>{ub_ex}</td>"
+            + "</tr>"
+        )
+
+    return (
+        "<div style='overflow-x:auto'>"
+        f"<table style='{table_style}'>"
+        + header
+        + "".join(rows)
+        + "</table>"
+        "</div>"
+    )
+
 def get_phototherapy_threshold(weight, days_old, has_kernicterus_risk=False):
-    """村田基準に基づいて光線療法基準値を取得"""
+    """村田・井村の基準に基づいて光線療法基準値を取得"""
     
     # 出生体重カテゴリーの決定
     if weight >= 2500:
@@ -64,36 +753,37 @@ def get_phototherapy_threshold(weight, days_old, has_kernicterus_risk=False):
             category = "≤ 999g"
         # ≤ 999g の場合はこれ以上低い基準がないので、そのまま使用
     
-    thresholds = ALL_PHOTOTHERAPY_THRESHOLDS[category]
+    thresholds = MURATA_PHOTOTHERAPY_THRESHOLDS[category]
     
     # 日齢に応じた基準値を取得
-    # 0日目の場合は1日目の基準値を使用（0日目は厳密には定義されていないため）
     if days_old == 0:
-        day = 1
-        threshold = thresholds.get(1, thresholds[7])
+        # 0日目は村田・井村の基準として定義がないため、数値を返さない
+        day = 0
+        threshold = None
         is_day0 = True
     else:
         day = min(days_old, 7)
         threshold = thresholds.get(day, thresholds[7])
         is_day0 = False
     
-    # 0日目の参考基準値も取得
-    day0_threshold = thresholds.get(0, None)
+    # 0日目の基準は未定義のため、参考値も返さない
+    day0_threshold = None
     
     # 核黄疸危険因子により基準を変更した場合の情報も返す
     adjusted = has_kernicterus_risk and original_category != category
     
     return category, threshold, adjusted, original_category, is_day0, day0_threshold
 
-def get_management_guidance(weight, is_first_child, delivery_method, gestational_age, days_old, has_iv_line=False, 
-                           maternal_diabetes=False, maternal_thyroid_medication=False, 
-                           maternal_thyroid_antibody=False, maternal_thyroid_history=False,
+def get_management_guidance(weight, is_first_child, delivery_method, gestational_age, days_old,
+                           maternal_diabetes=False, maternal_thyroid_abnormal=False,
                            apgar_score_5min=9, delivery_stress=False, birth_date=None, birth_time=None,
                            exchange_transfusion=False, intracranial_hemorrhage=False,
-                           apnea_treatment=False, gentamicin_history=False, amikacin_history=False,
-                           high_oxygen=False, municipality="茅ヶ崎市", corrected_weeks=0, expanded_mass_screening=False,
-                           gestational_weeks=0, gestational_days=0):
+                           apnea_treatment=False, aminoglycoside_history=False,
+                           high_oxygen=False, corrected_weeks=0,
+                           gestational_weeks=0, gestational_days=0,
+                           weight_lt_p10=False, weight_ge_p90=False):
     """新生児の体重や状況に基づいて管理方針を決定"""
+    
     guidance = {
         'category': '',
         'recommendations': [],
@@ -101,37 +791,31 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
         'special_management': []
     }
     
-    # 体重分類（カテゴリーのみ）
-    if weight < 1000:
-        guidance['category'] = '極低出生体重児（ELBW）'
-        guidance['warnings'].append('⚠️ 専門的なNICU管理が必要です')
+    # 分類（出生体重 + 早産の程度）
+    if weight >= 4000:
+        weight_cat = '高出生体重児'
+    elif weight >= 2500:
+        weight_cat = '正常出生体重児'
+    elif weight < 1000:
+        weight_cat = '超極低出生体重児（ELBW）'
     elif weight < 1500:
-        guidance['category'] = '超低出生体重児（VLBW）'
-        guidance['warnings'].append('⚠️ NICUでの管理が推奨されます')
-    elif weight < 2500:
-        guidance['category'] = '低出生体重児（LBW）'
+        weight_cat = '極低出生体重児（VLBW）'
     else:
-        guidance['category'] = '正常出生体重児'
-    
-    # 在胎週数による考慮事項
-    if gestational_age < 37:
-        guidance['warnings'].append('⚠️ 早産児のため、呼吸、体温、栄養管理に特に注意が必要です')
-        guidance['recommendations'].append('・早産児スクリーニング：ROP（未熟児網膜症）のスクリーニングを検討')
+        weight_cat = '低出生体重児（LBW）'
+
+    if gestational_age >= 42:
+        prematurity_cat = '過期産'
+    elif gestational_age >= 37:
+        prematurity_cat = '正期産'
+    elif gestational_age >= 34:
+        prematurity_cat = '後期早産'
+    else:
+        prematurity_cat = '早産'
+
+    guidance['category'] = f"{prematurity_cat} / {weight_cat}"
     
     # ケイツーシロップ12回投与法（すべての子どもに適応）
-    k2_guidance = []
-    
-    # 1回目：日齢0（点滴あり）または日齢1（点滴なし）
-    if has_iv_line:
-        k2_guidance.append('・1回目：日齢0にケイツーシロップを静注（極低出生体重児の場合は半量）')
-    else:
-        k2_guidance.append('・1回目：日齢1にケイツーシロップ内服（極低出生体重児でも減量しない）')
-    
-    # 2回目：日齢4
-    if has_iv_line:
-        k2_guidance.append('・2回目：日齢4に消化が良ければケイツーシロップ内服、悪ければ静注（極低出生体重児の場合は静注は半量）')
-    else:
-        k2_guidance.append('・2回目：日齢4にケイツーシロップ内服（極低出生体重児でも減量しない）')
+    k2_third_to_twelfth = None
     
     # 3回目以降：日齢11以降に迎える水曜日から毎週水曜日に12回目まで
     if birth_date and birth_time:
@@ -146,13 +830,14 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
         
         if first_wednesday_after_day11:
             last_wednesday = first_wednesday_after_day11 + timedelta(weeks=9)  # 12回目（3回目から10週後）
-            k2_guidance.append(f'・3回目〜12回目：{first_wednesday_after_day11.strftime("%Y年%m月%d日")}（水曜日）から{last_wednesday.strftime("%Y年%m月%d日")}（水曜日）まで毎週水曜日に内服')
+            k2_third_to_twelfth = f'{first_wednesday_after_day11.strftime("%Y/%m/%d")}から{last_wednesday.strftime("%Y/%m/%d")}まで毎週水曜日に内服'
     
     # すべての子どもに適応があるため、常に表示
     guidance['special_management'].append({
         'title': '💊 ケイツーシロップ12回投与法',
-        'items': k2_guidance + [
-            '・入院中の内服は処置オーダとして手続する',
+        'k2_third_to_twelfth': k2_third_to_twelfth,
+        'items': [
+            '・入院中の内服は処置オーダで指示する',
             '・退院処方として12回目までのケイツーを処方する'
         ],
         'needed': True
@@ -160,14 +845,11 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
     
     # マススクリーニング（すべての子どもに適応）
     mass_screening_items = []
-    if days_old == 4:
-        mass_screening_items.append('・日齢4：マススクリーニングを実施')
-        if expanded_mass_screening:
-            mass_screening_items.append('・拡大マススクリーニングも実施（希望あり）')
-    elif days_old < 4:
-        mass_screening_items.append('・日齢4：マススクリーニングを実施予定')
-        if expanded_mass_screening:
-            mass_screening_items.append('・拡大マススクリーニングも実施予定（希望あり）')
+    if birth_date:
+        day4_date = birth_date + timedelta(days=4)
+        mass_screening_items.append(f'・日齢4（{day4_date.strftime("%Y/%m/%d")}）：マススクリーニングを実施（希望あれば拡大マスも）')
+    else:
+        mass_screening_items.append('・日齢4：マススクリーニングを実施（希望あれば拡大マスも）')
     
     # 早産児は退院前にマススクリーニング再検
     if gestational_age < 37:
@@ -180,10 +862,12 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
         'needed': True
     })
     
-    # 低血糖ハイリスク児の管理
+    # 血糖チェック
     hypoglycemia_risk = (
         gestational_age < 37 or
         weight < 2500 or
+        maternal_diabetes or
+        weight_ge_p90 or
         maternal_diabetes or
         delivery_stress or
         apgar_score_5min < 7
@@ -195,22 +879,23 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
         if gestational_age < 37:
             risk_reasons.append("在胎37週未満")
         if weight < 2500:
-            risk_reasons.append("体重2500g未満")
+            risk_reasons.append("出生体重2500g未満")
+        if weight_ge_p90:
+            risk_reasons.append("出生体重90%ile以上")
         if maternal_diabetes:
-            risk_reasons.append("糖尿病母体")
+            risk_reasons.append("妊娠糖尿病")
         if delivery_stress:
             risk_reasons.append("分娩ストレス")
         if apgar_score_5min < 7:
             risk_reasons.append("Apgar5分値7未満")
         
         items = [
-            f'・適応理由：{"、".join(risk_reasons)}',
-            '・出生3時間後に簡易血糖測定を実施',
-            '・出生6時間後に簡易血糖測定を実施',
-            '・出生12時間後に簡易血糖測定を実施'
+            '・出生後できるだけ早期にミルクを開始（糖水は避ける）',
+            '・その後も3時間毎に哺乳を継続',
+            '・出生3/6/12時間後に簡易血糖測定を実施'
         ]
         guidance['special_management'].append({
-            'title': '🩸 低血糖ハイリスク児の管理',
+            'title': '🩸 血糖チェック',
             'items': items,
             'needed': True
         })
@@ -228,54 +913,28 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
         if apgar_score_5min >= 7:
             reason.append("Apgar5分値7以上")
         guidance['special_management'].append({
-            'title': '🩸 低血糖ハイリスク児の管理',
+            'title': '🩸 血糖チェック',
             'items': [f'・適応なし（{"、".join(reason[:3]) if reason else "低血糖リスク因子なし"}）'],
             'needed': False
         })
     
     # 甲状腺機能検査の対象児
-    thyroid_check_needed = (
-        maternal_thyroid_medication or
-        maternal_thyroid_antibody or
-        maternal_thyroid_history
-    )
+    thyroid_check_needed = maternal_thyroid_abnormal
     
     if thyroid_check_needed:
-        # 適応理由を取得
-        thyroid_reasons = []
-        if maternal_thyroid_medication:
-            thyroid_reasons.append("甲状腺に関する内服加療中の母体")
-        if maternal_thyroid_antibody:
-            thyroid_reasons.append("抗甲状腺抗体陽性の母体")
-        if maternal_thyroid_history:
-            thyroid_reasons.append("甲状腺疾患の既往があり、妊娠経過中の情報が不明")
-        
         thyroid_items = [
-            f'・適応理由：{"、".join(thyroid_reasons)}',
-            '・出生前に臍帯血保存用の生化学スピッツ（茶色）を準備しておく',
-            '・出生後、生化学スピッツに臍帯血を入れて保存しておく',
-            '・医師は臍帯血及び日齢4の児血についてTSHとfT4をオーダする'
+            '・適応理由：母体の甲状腺異常あり',
+            '・日齢5でTSH/FT4を測定',
+            '・必要に応じて小児科内分泌に相談'
         ]
-        
-        # 日齢4が休日の場合の処理
-        if days_old == 4 and birth_date:
-            check_date = birth_date + timedelta(days=4)
-            if check_date.weekday() >= 5:  # 土曜日(5)または日曜日(6)
-                thyroid_items.append('・日齢4が休日のため、次の平日まで延期')
-        
-        thyroid_items.extend([
-            '・TSH<0.01の時は治療を開始',
-            '・fT4>3なら治療か再検を検討'
-        ])
-        
         guidance['special_management'].append({
-            'title': '🔬 甲状腺機能検査の対象児',
+            'title': '🦋 甲状腺機能検査',
             'items': thyroid_items,
             'needed': True
         })
     else:
         guidance['special_management'].append({
-            'title': '🔬 甲状腺機能検査の対象児',
+            'title': '🦋 甲状腺機能検査',
             'items': ['・適応なし（母体の甲状腺関連情報なし）'],
             'needed': False
         })
@@ -335,8 +994,7 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
         weight <= 1800 or
         exchange_transfusion or  # 重症黄疸（交換輸血を実施）
         apnea_treatment or
-        gentamicin_history or
-        amikacin_history or
+        aminoglycoside_history or
         intracranial_hemorrhage
     )
     
@@ -351,10 +1009,8 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
             aabr_reasons.append("交換輸血を実施")
         if apnea_treatment:
             aabr_reasons.append("無呼吸発作治療")
-        if gentamicin_history:
-            aabr_reasons.append("ゲンタシン投与歴")
-        if amikacin_history:
-            aabr_reasons.append("アミカシン投与歴")
+        if aminoglycoside_history:
+            aabr_reasons.append("アミノグリコシド投与歴")
         if intracranial_hemorrhage:
             aabr_reasons.append("頭蓋内出血")
         
@@ -377,8 +1033,8 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
             reason.append("交換輸血なし")
         if not apnea_treatment:
             reason.append("無呼吸発作治療なし")
-        if not gentamicin_history and not amikacin_history:
-            reason.append("ゲンタシン/アミカシン投与歴なし")
+        if not aminoglycoside_history:
+            reason.append("アミノグリコシド投与歴なし")
         if not intracranial_hemorrhage:
             reason.append("頭蓋内出血なし")
         guidance['special_management'].append({
@@ -432,80 +1088,6 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
             'needed': False
         })
     
-    # 予防接種
-    # 退院前に2か月齢を迎える可能性がある児
-    # 条件：出生から2か月経っても修正週数が37週未満、または体重が2300g未満、またはその他の理由で入院が長引く可能性がある
-    # 2か月後の修正週数を計算
-    total_gestational_days_at_birth = gestational_weeks * 7 + gestational_days
-    total_days_at_two_months = total_gestational_days_at_birth + 60
-    corrected_weeks_at_two_months = total_days_at_two_months // 7
-    
-    # 2か月後の体重を予測（オーバートリアージ）
-    # 体重増加率は出生体重に応じて設定（控えめに予測）
-    if weight < 1500:
-        daily_weight_gain = 10  # 極低出生体重児：1日10g増加
-    elif weight < 2500:
-        daily_weight_gain = 15  # 低出生体重児：1日15g増加
-    else:
-        daily_weight_gain = 20  # 正常出生体重児：1日20g増加
-    
-    predicted_weight_at_two_months = weight + (daily_weight_gain * 60)
-    
-    # 退院が長引く可能性がある条件
-    long_stay_possible = (
-        corrected_weeks_at_two_months < 37 or  # 2か月経っても修正37週未満
-        predicted_weight_at_two_months < 2300 or  # 2か月後も2300g未満になりそう
-        exchange_transfusion or  # 交換輸血を実施（重症黄疸）
-        intracranial_hemorrhage or  # 頭蓋内出血
-        apnea_treatment or  # 無呼吸発作治療
-        high_oxygen  # 高濃度酸素投与歴
-    )
-    
-    if long_stay_possible and days_old < 60:
-        # 適応理由を取得
-        vaccine_reasons = []
-        if corrected_weeks_at_two_months < 37:
-            vaccine_reasons.append("2か月後も修正37週未満")
-        if predicted_weight_at_two_months < 2300:
-            vaccine_reasons.append("2か月後も体重2300g未満になりそう")
-        if exchange_transfusion:
-            vaccine_reasons.append("交換輸血を実施")
-        if intracranial_hemorrhage:
-            vaccine_reasons.append("頭蓋内出血")
-        if apnea_treatment:
-            vaccine_reasons.append("無呼吸発作治療")
-        if high_oxygen:
-            vaccine_reasons.append("高濃度酸素投与歴")
-        
-        vaccine_items = [
-            f'・適応理由：{"、".join(vaccine_reasons)}',
-            '・退院前に2か月齢を迎える可能性があるため、予防接種を検討',
-            '・注意：ロタワクチンは二次感染を考慮し、入院中は行わない（退院日も）'
-        ]
-        if municipality not in ["茅ヶ崎市", "寒川町"]:
-            vaccine_items.append(f'・児の登録されている自治体が{municipality}の場合は当該の自治体へ連絡が必要')
-        guidance['special_management'].append({
-            'title': '💉 予防接種',
-            'items': vaccine_items,
-            'needed': True
-        })
-    else:
-        # 適応がない理由を判定
-        reason = []
-        if corrected_weeks_at_two_months >= 37:
-            reason.append("2か月後も修正37週以上")
-        if predicted_weight_at_two_months >= 2300:
-            reason.append("2か月後も体重2300g以上になりそう")
-        if not exchange_transfusion and not intracranial_hemorrhage and not apnea_treatment and not high_oxygen:
-            reason.append("その他の入院長期化要因なし")
-        if days_old >= 60:
-            reason.append("既に2か月齢を超えている")
-        guidance['special_management'].append({
-            'title': '💉 予防接種',
-            'items': [f'・該当なし（{"、".join(reason[:2]) if reason else "退院前に2か月齢を迎える可能性が低い"}）'],
-            'needed': False
-        })
-    
     # 特別な管理項目をrecommendationsに変換
     for special in guidance['special_management']:
         if special.get('needed', True):
@@ -519,138 +1101,185 @@ def get_management_guidance(weight, is_first_child, delivery_method, gestational
     return guidance
 
 # 入力フィールド
-st.header("📝 赤ちゃんの情報を入力してください")
+st.header("✍️ 入力")
 
 # 基本情報
-st.subheader("👶 基本情報")
-col1, col2, col3 = st.columns(3)
-with col1:
+st.subheader("ℹ️ 基本情報")
+row1 = st.columns([1.8, 1.6, 1.2, 0.8])
+with row1[0]:
     birth_date = st.date_input(
         "出生日",
         value=date.today(),
         max_value=date.today()
     )
-with col2:
+with row1[1]:
     birth_time = st.time_input("出生時刻", value=datetime.now().time())
-with col3:
-    gender = st.selectbox(
-        "性別",
-        ["男児", "女児"]
+with row1[2]:
+    gestational_weeks = st.number_input(
+        "在胎週数（週）",
+        min_value=20,
+        max_value=42,
+        value=39,
+        step=1
+    )
+with row1[3]:
+    gestational_days = st.number_input(
+        "（日）",
+        min_value=0,
+        max_value=6,
+        value=0,
+        step=1
     )
 
-col1, col2 = st.columns(2)
-with col1:
-    birth_weight = st.number_input(
-        "出生体重 (g)",
-        min_value=500,
-        max_value=6000,
-        value=3000,
-        step=10
+row2 = st.columns([1.8, 1.6, 1.3, 1.1])
+with row2[0]:
+    if "birth_weight_unknown" not in st.session_state:
+        st.session_state.birth_weight_unknown = False
+    if "birth_weight" not in st.session_state:
+        st.session_state.birth_weight = 3000
+
+    col_wt, col_wt_unknown = st.columns([3, 1], vertical_alignment="bottom")
+    with col_wt:
+        st.number_input(
+            "出生体重 (g)",
+            min_value=500,
+            max_value=6000,
+            value=int(st.session_state.birth_weight),
+            step=1,
+            key="birth_weight",
+        )
+    with col_wt_unknown:
+        st.checkbox("未測定", key="birth_weight_unknown")
+with row2[1]:
+    if "birth_length_unknown" not in st.session_state:
+        st.session_state.birth_length_unknown = False
+    if "birth_length" not in st.session_state:
+        st.session_state.birth_length = 50.0
+
+    col_len, col_len_unknown = st.columns([3, 1], vertical_alignment="bottom")
+    with col_len:
+        st.number_input(
+            "出生身長 (cm)",
+            min_value=20.0,
+            max_value=70.0,
+            value=float(st.session_state.birth_length),
+            step=0.1,
+            format="%.1f",
+            key="birth_length",
+        )
+    with col_len_unknown:
+        st.checkbox("未測定", key="birth_length_unknown")
+with row2[2]:
+    gender = st.radio(
+        "性別",
+        ["男児", "女児"],
+        horizontal=True,
     )
-with col2:
+with row2[3]:
     is_first_child = st.radio(
         "初産/経産",
         ["初産", "経産"],
         horizontal=True
     )
 
-# 分娩情報
-st.subheader("🤱 分娩情報")
-col1, col2 = st.columns(2)
-with col1:
+birth_weight_unknown = bool(st.session_state.birth_weight_unknown)
+birth_weight = None if birth_weight_unknown else float(st.session_state.birth_weight)
+birth_length_unknown = bool(st.session_state.birth_length_unknown)
+birth_length = None if birth_length_unknown else float(st.session_state.birth_length)
+
+if birth_weight_unknown:
+    st.markdown(
+        """
+<style>
+div[data-testid="stNumberInput"] input[aria-label="出生体重 (g)"] {
+  opacity: 0.45;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+if birth_length_unknown:
+    st.markdown(
+        """
+<style>
+div[data-testid="stNumberInput"] input[aria-label="出生身長 (cm)"] {
+  opacity: 0.45;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+# 分娩情報 + Apgar
+row3 = st.columns([1.8, 1, 1])
+with row3[0]:
     delivery_method = st.selectbox(
         "分娩形式",
         ["経腟分娩", "計画帝王切開", "緊急帝王切開", "吸引・鉗子分娩", "その他"]
     )
-with col2:
-    col_weeks, col_days = st.columns(2)
-    with col_weeks:
-        gestational_weeks = st.number_input(
-            "在胎週数（週）",
-            min_value=20,
-            max_value=42,
-            value=39,
-            step=1
-        )
-    with col_days:
-        gestational_days = st.number_input(
-            "在胎日数（日）",
-            min_value=0,
-            max_value=6,
-            value=0,
-            step=1
-        )
-gestational_age = gestational_weeks + gestational_days / 7.0
-
-# Apgarスコア
-st.subheader("📊 Apgarスコア")
-col1, col2 = st.columns(2)
-with col1:
+with row3[1]:
     apgar_score_1min = st.number_input(
-        "Apgarスコア（1分）",
+        "Apgar（1分）",
         min_value=0,
         max_value=10,
         value=9,
         step=1
     )
-with col2:
+with row3[2]:
     apgar_score_5min = st.number_input(
-        "Apgarスコア（5分）",
+        "Apgar（5分）",
         min_value=0,
         max_value=10,
         value=9,
         step=1
     )
+gestational_age = gestational_weeks + gestational_days / 7.0
 
 
 # 追加情報
-st.subheader("ℹ️ 追加情報")
+st.subheader("🤰 母体情報")
 col1, col2 = st.columns(2)
 with col1:
-    has_iv_line = st.checkbox("点滴ラインあり")
-    maternal_diabetes = st.checkbox("糖尿病母体より出生")
-    maternal_thyroid_medication = st.checkbox("甲状腺に関する内服加療中の母体より出生")
+    maternal_diabetes = st.checkbox(f"妊娠糖尿病 {ICON_HYPOGLYCEMIA}")
 with col2:
-    maternal_thyroid_antibody = st.checkbox("抗甲状腺抗体(TRAbまたはTSAb)陽性の母体より出生")
-    maternal_thyroid_history = st.checkbox("甲状腺疾患の既往があり、妊娠経過中の情報が不明")
-    expanded_mass_screening = st.checkbox("拡大マススクリーニング希望")
+    maternal_thyroid_abnormal = st.checkbox(f"甲状腺異常 {ICON_THYROID}")
+st.caption("甲状腺異常：内服加療中 / 抗甲状腺抗体陽性 / 既往あり（妊娠経過の情報不明）などを含む")
 
-# 検査・治療歴
-st.subheader("🏥 検査・治療歴")
+st.subheader("👶 新生児情報")
 col1, col2 = st.columns(2)
 with col1:
-    exchange_transfusion = st.checkbox("重症黄疸（交換輸血を実施）")
-    intracranial_hemorrhage = st.checkbox("頭蓋内出血")
-    apnea_treatment = st.checkbox("無呼吸発作治療")
-    respiratory_distress = st.checkbox("呼吸窮迫（PaO2≦40が2時間以上持続）")
-    acidosis = st.checkbox("アシドーシス（pH≦7.15）")
+    exchange_transfusion = st.checkbox(f"重症黄疸（交換輸血を実施） {ICON_JAUNDICE}{ICON_AABR}{ICON_MRI}")
+    intracranial_hemorrhage = st.checkbox(f"頭蓋内出血 {ICON_AABR}{ICON_MRI}")
+    apnea_treatment = st.checkbox(f"無呼吸発作治療 {ICON_AABR}")
+    high_oxygen = st.checkbox(f"高濃度酸素投与歴 {ICON_EYE}")
+    respiratory_distress = st.checkbox(f"呼吸窮迫（PaO2≦40が2時間以上持続） {ICON_JAUNDICE}")
+    acidosis = st.checkbox(f"アシドーシス（pH≦7.15） {ICON_JAUNDICE}")
 with col2:
-    gentamicin_history = st.checkbox("ゲンタシン投与歴")
-    amikacin_history = st.checkbox("アミカシン投与歴")
-    high_oxygen = st.checkbox("高濃度酸素投与歴")
-    hypothermia = st.checkbox("低体温（直腸温<35℃が2時間以上持続）")
-    hypoproteinemia = st.checkbox("低蛋白血症（血清蛋白≦4.0またはAlb≦2.5）")
-    hypoglycemia = st.checkbox("低血糖")
-    hemolysis = st.checkbox("溶血")
-    cns_abnormality = st.checkbox("敗血症を含む中枢神経系の異常徴候")
-
-# その他
-st.subheader("📍 その他")
-municipality = st.selectbox(
-    "登録自治体",
-    ["茅ヶ崎市", "寒川町", "その他"],
-    help="予防接種の連絡先を決定するため"
-)
+    aminoglycoside_history = st.checkbox(f"アミノグリコシド投与歴（ゲンタシン/アミカシンなど） {ICON_AABR}")
+    hypothermia = st.checkbox(f"低体温（直腸温<35℃が2時間以上持続） {ICON_JAUNDICE}")
+    hypoproteinemia = st.checkbox(f"低蛋白血症（血清蛋白≦4.0またはAlb≦2.5） {ICON_JAUNDICE}")
+    hypoglycemia = st.checkbox(f"低血糖 {ICON_JAUNDICE}")
+    hemolysis = st.checkbox(f"溶血 {ICON_JAUNDICE}")
+    cns_abnormality = st.checkbox(f"敗血症を含む中枢神経系の異常徴候 {ICON_JAUNDICE}")
 
 # 日齢の計算
 today = date.today()
 days_old = (today - birth_date).days
+
+now_dt = datetime.now()
+birth_dt = datetime.combine(birth_date, birth_time)
+hours_old = (now_dt - birth_dt).total_seconds() / 3600
+if hours_old < 0:
+    hours_old = 0.0
 
 # 修正週数・日数の計算
 total_gestational_days = gestational_weeks * 7 + gestational_days
 corrected_total_days = total_gestational_days + days_old
 corrected_weeks = corrected_total_days // 7
 corrected_days = corrected_total_days % 7
+
+morioka = get_morioka_thresholds(corrected_weeks, hours_old)
 
 # 核黄疸危険因子の自動判定（Apgarスコア5分値≦3、またはその他の危険因子がある場合）
 has_kernicterus_risk = (
@@ -665,14 +1294,22 @@ has_kernicterus_risk = (
 )
 
 # 光線療法基準の計算
-phototherapy_category, phototherapy_threshold, adjusted, original_category, is_day0, day0_threshold = get_phototherapy_threshold(
-    birth_weight,
-    days_old,
-    has_kernicterus_risk
-)
+if birth_weight is None:
+    phototherapy_category = None
+    phototherapy_threshold = None
+    adjusted = False
+    original_category = None
+    is_day0 = False
+    day0_threshold = None
+else:
+    phototherapy_category, phototherapy_threshold, adjusted, original_category, is_day0, day0_threshold = get_phototherapy_threshold(
+        birth_weight,
+        days_old,
+        has_kernicterus_risk
+    )
 
 st.markdown("---")
-st.header("📋 新生児管理の推奨事項")
+st.header("🏷️ 判定結果")
 
 # 日齢と修正週数・日数の表示
 col1, col2 = st.columns(2)
@@ -689,64 +1326,300 @@ delivery_stress = (
 
 # 管理方針の取得
 is_first_child_bool = is_first_child == "初産"
-guidance = get_management_guidance(
-    birth_weight,
+
+taikaku_rows = load_taikaku_birth_lms("taikakubirthlongcross_v1.1.xlsx")
+birth_thresholds = get_birth_size_thresholds(
+    taikaku_rows,
+    gender,
     is_first_child_bool,
-    delivery_method,
-    gestational_age,
-    days_old,
-    has_iv_line,
-    maternal_diabetes,
-    maternal_thyroid_medication,
-    maternal_thyroid_antibody,
-    maternal_thyroid_history,
-    apgar_score_5min,
-    delivery_stress,
-    birth_date,
-    birth_time,
-    exchange_transfusion,
-    intracranial_hemorrhage,
-    apnea_treatment,
-    gentamicin_history,
-    amikacin_history,
-    high_oxygen,
-    municipality,
-    corrected_weeks,
-    expanded_mass_screening,
     gestational_weeks,
-    gestational_days
+    gestational_days,
 )
 
-# 分類の表示
-st.subheader(f"分類: {guidance['category']}")
+weight_lt_p10 = False
+weight_ge_p90 = False
+weight_lt_minus2sd = False
+height_lt_p10 = False
+height_lt_minus2sd = False
+if birth_thresholds is not None:
+    if birth_weight is not None and birth_thresholds.get("weight_p10_g") is not None:
+        weight_lt_p10 = birth_weight < birth_thresholds["weight_p10_g"]
+    if birth_weight is not None and birth_thresholds.get("weight_p90_g") is not None:
+        weight_ge_p90 = birth_weight > birth_thresholds["weight_p90_g"]
+    if birth_weight is not None and birth_thresholds.get("weight_minus2sd_g") is not None:
+        weight_lt_minus2sd = birth_weight < birth_thresholds["weight_minus2sd_g"]
 
-# 警告の表示
-if guidance['warnings']:
-    for warning in guidance['warnings']:
-        st.warning(warning)
+    if birth_length is not None:
+        if birth_thresholds.get("height_p10_cm") is not None:
+            height_lt_p10 = birth_length < birth_thresholds["height_p10_cm"]
+        if birth_thresholds.get("height_minus2sd_cm") is not None:
+            height_lt_minus2sd = birth_length < birth_thresholds["height_minus2sd_cm"]
+
+eu_sga = False
+lfd = False
+sga = False
+sga_gh = False
+aga = False
+hfd_lga = False
+
+if birth_weight is None:
+    eu_sga = False
+    lfd = False
+    sga = False
+    sga_gh = False
+    aga = False
+    hfd_lga = False
+elif birth_length is None:
+    eu_sga = weight_lt_minus2sd
+    # 身長未測定時：体重のみで判定
+    lfd = weight_lt_p10
+    aga = (not weight_lt_p10) and (not weight_ge_p90)
+    hfd_lga = weight_ge_p90
+else:
+    eu_sga = (weight_lt_minus2sd or height_lt_minus2sd)
+    lfd = (weight_lt_p10 and (not height_lt_p10))
+    sga = (weight_lt_p10 and height_lt_p10)
+    sga_gh = (sga and (weight_lt_minus2sd or height_lt_minus2sd))
+    aga = (not weight_lt_p10) and (not weight_ge_p90)
+    hfd_lga = weight_ge_p90
+
+birth_plane_fig = build_birth_size_plane_fig(birth_weight, birth_length, birth_thresholds)
+if birth_weight is None:
+    if gestational_age >= 42:
+        prematurity_cat = "過期産"
+    elif gestational_age >= 37:
+        prematurity_cat = "正期産"
+    elif gestational_age >= 34:
+        prematurity_cat = "後期早産"
+    else:
+        prematurity_cat = "早産"
+
+    mass_screening_items = []
+    if birth_date:
+        day4_date = birth_date + timedelta(days=4)
+        mass_screening_items.append(
+            f"・日齢4（{day4_date.strftime('%Y/%m/%d')}）：マススクリーニングを実施（希望あれば拡大マスも）"
+        )
+    else:
+        mass_screening_items.append("・日齢4：マススクリーニングを実施（希望あれば拡大マスも）")
+    if gestational_age < 37:
+        mass_screening_items.append("・早産児のため、退院前にマススクリーニング再検を行う")
+
+    guidance = {
+        "category": prematurity_cat,
+        "recommendations": [],
+        "warnings": [],
+        "special_management": [
+            {
+                "title": "💊 ケイツーシロップ12回投与法",
+                "k2_third_to_twelfth": None,
+                "items": [
+                    "・入院中の内服は処置オーダで指示する",
+                    "・退院処方として12回目までのケイツーを処方する",
+                ],
+                "needed": True,
+            },
+            {
+                "title": "🧪 マススクリーニング",
+                "items": mass_screening_items,
+                "needed": True,
+            },
+            {
+                "title": "⚠️ 体重未測定のため一部判定不可",
+                "items": [
+                    "・出生体重区分、低血糖リスク、SGA/LGA判定などは体重測定後に評価",
+                ],
+                "needed": False,
+            },
+        ],
+    }
+else:
+    guidance = get_management_guidance(
+        birth_weight,
+        is_first_child_bool,
+        delivery_method,
+        gestational_age,
+        days_old,
+        maternal_diabetes,
+        maternal_thyroid_abnormal,
+        apgar_score_5min,
+        delivery_stress,
+        birth_date,
+        birth_time,
+        exchange_transfusion,
+        intracranial_hemorrhage,
+        apnea_treatment,
+        aminoglycoside_history,
+        high_oxygen,
+        corrected_weeks,
+        gestational_weeks,
+        gestational_days,
+        weight_lt_p10,
+        weight_ge_p90
+    )
+
+# 分類の表示
+if birth_thresholds is None:
+    birth_size_label = None
+elif birth_weight is None:
+    birth_size_label = None
+else:
+    if hfd_lga:
+        birth_size_label = "heavy-for-dates (HFD) / large for gestational age (LGA)"
+    elif aga:
+        birth_size_label = "appropriate for gestational age (AGA)"
+    elif sga_gh:
+        birth_size_label = "small for gestational age (SGA)（GH適応）"
+    elif sga:
+        birth_size_label = "small for gestational age (SGA)（GH適応なし）"
+    elif lfd:
+        birth_size_label = "light-for-dates (LFD)"
+    else:
+        birth_size_label = "判定不可"
+if birth_size_label:
+    st.subheader(f"分類: {guidance['category']} / {birth_size_label}")
+else:
+    st.subheader(f"分類: {guidance['category']}")
+
+if birth_thresholds is not None:
+    st.caption(f"{gender} / {is_first_child} / 在胎{gestational_weeks}週{gestational_days}日")
+
+    wL, wM, wS = birth_thresholds.get("weight_lms", (None, None, None))
+    w_z = value_to_lms_z(wL, wM, wS, birth_weight)
+    w_p = z_to_percentile(w_z)
+
+    w_z_text = "-" if w_z is None else f"{w_z:+.2f}SD"
+    w_p_text = "-" if w_p is None else f"{w_p:.1f}%ile"
+    if birth_weight is None:
+        st.markdown(
+            "体重: **未測定**"
+            f"（-2SD {birth_thresholds['weight_minus2sd_g']:.0f}g / 10%ile {birth_thresholds['weight_p10_g']:.0f}g / 90%ile {birth_thresholds['weight_p90_g']:.0f}g）"
+        )
+    else:
+        st.markdown(
+            f"体重: **{birth_weight:.0f}g / {w_z_text} / {w_p_text}**"
+            f"（-2SD {birth_thresholds['weight_minus2sd_g']:.0f}g / 10%ile {birth_thresholds['weight_p10_g']:.0f}g / 90%ile {birth_thresholds['weight_p90_g']:.0f}g）"
+        )
+
+    if birth_length is None:
+        st.markdown(
+            "身長: **未測定**"
+            f"（-2SD {birth_thresholds['height_minus2sd_cm']:.1f}cm / 10%ile {birth_thresholds['height_p10_cm']:.1f}cm / 90%ile {birth_thresholds['height_p90_cm']:.1f}cm）"
+        )
+    else:
+        hL, hM, hS = birth_thresholds.get("height_lms", (None, None, None))
+        h_z = value_to_lms_z(hL, hM, hS, birth_length)
+        h_p = z_to_percentile(h_z)
+        h_z_text = "-" if h_z is None else f"{h_z:+.2f}SD"
+        h_p_text = "-" if h_p is None else f"{h_p:.1f}%ile"
+        st.markdown(
+            f"身長: **{birth_length:.1f}cm / {h_z_text} / {h_p_text}**"
+            f"（-2SD {birth_thresholds['height_minus2sd_cm']:.1f}cm / 10%ile {birth_thresholds['height_p10_cm']:.1f}cm / 90%ile {birth_thresholds['height_p90_cm']:.1f}cm）"
+        )
+    if birth_plane_fig is not None:
+        st.plotly_chart(birth_plane_fig, use_container_width=True)
 
 # 推奨事項の表示
 st.subheader("✅ 管理のポイント")
-for rec in guidance['recommendations']:
-    if rec.startswith('<span'):
-        st.markdown(rec, unsafe_allow_html=True)
+specials = guidance.get('special_management', [])
+
+for special in specials:
+    is_needed = special.get('needed', True)
+    if is_needed:
+        st.markdown(f"**{special['title']}**")
+        if special.get('title') == '💊 ケイツーシロップ12回投与法':
+            if birth_date:
+                d0 = birth_date.strftime('%Y/%m/%d')
+                d1 = (birth_date + timedelta(days=1)).strftime('%Y/%m/%d')
+                d4 = (birth_date + timedelta(days=4)).strftime('%Y/%m/%d')
+                d11 = (birth_date + timedelta(days=11)).strftime('%Y/%m/%d')
+            else:
+                d0 = d1 = d4 = d11 = None
+
+            third = special.get('k2_third_to_twelfth')
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                st.markdown("#### 1回目")
+                st.caption(f"日齢0（{d0}） / 日齢1（{d1}）" if d0 else "日齢0 / 日齢1")
+                st.markdown("- 点滴あり：日齢0に静注（ELBWは半量）")
+                st.markdown("- 点滴なし：日齢1に内服（ELBWも減量しない）")
+
+            with b2:
+                st.markdown("#### 2回目")
+                st.caption(f"日齢4（{d4}）" if d4 else "日齢4")
+                st.markdown("- 消化不良：静注（ELBWは半量）")
+                st.markdown("- 消化良好：内服")
+
+            with b3:
+                st.markdown("#### 3〜12回目")
+                st.caption(f"日齢11（{d11}）以降" if d11 else "日齢11以降")
+                if third:
+                    st.markdown(f"- {third}")
+                else:
+                    st.markdown("- 日齢11以降の最初の水曜から毎週水曜に内服")
+
+            st.markdown("- 入院中の内服は処置オーダで指示する")
+            st.markdown("- 退院処方として12回目までを処方する")
+            continue
+        for item in special.get('items', []):
+            st.markdown(item)
     else:
-        st.markdown(rec)
+        st.markdown(
+            f"<span style='color: gray;'><b>{special['title']}</b></span>",
+            unsafe_allow_html=True
+        )
+        for item in special.get('items', []):
+            st.markdown(f"<span style='color: gray;'>{item}</span>", unsafe_allow_html=True)
 
-# 光線療法基準の表示（管理のポイントの中）
 st.markdown("---")
-st.markdown("### 💡 光線療法基準（村田基準）")
+st.markdown("## 💡 光線療法基準")
 
-# 情報メッセージ（グラフの上に表示）
-st.metric("適用基準ライン", phototherapy_category)
-if is_day0:
-    threshold_message = f"💡 今日は0日目です。0日目は厳密には基準値が定義されていないため、**1日目の基準値（{phototherapy_threshold} mg/dL）**を参考にしてください。"
-    if day0_threshold:
-        threshold_message += f"\n\n📌 0日目の参考値: {day0_threshold} mg/dL（参考値としてのみ使用）"
+st.markdown("### ✅ 現在の基準値")
+sum1, sum2 = st.columns(2)
+with sum1:
+    st.markdown("**村田・井村の基準**")
+    if phototherapy_category is None:
+        st.markdown("適用ライン: **体重未測定のため判定不可**")
+    else:
+        st.markdown(f"適用ライン: **{phototherapy_category}**")
+    st.markdown(f"日齢: {days_old}日")
+    if phototherapy_threshold is None:
+        st.metric("TB基準値", "未定義")
+    else:
+        st.metric("TB基準値", f"{phototherapy_threshold} mg/dL")
+
+with sum2:
+    st.markdown("**📊 神戸大学（森岡）の基準**")
+    if morioka is None:
+        st.markdown("対象外")
+    else:
+        pca_low, pca_high = morioka["pca_group"]
+        if pca_high == float("inf"):
+            pca_label = f"{pca_low}週以上"
+        else:
+            pca_label = f"{pca_low}-{pca_high}週" if pca_low != pca_high else f"{pca_low}週"
+
+        st.markdown(f"修正週数: **{pca_label}**")
+        st.markdown(f"出生後時間: **{morioka['time_label']}**（{hours_old:.1f}時間）")
+        morioka_tb1, morioka_tb2, morioka_tb3 = st.columns(3)
+        with morioka_tb1:
+            st.metric("TB low", f"{morioka['tb']['low']} mg/dL")
+        with morioka_tb2:
+            st.metric("TB high", f"{morioka['tb']['high']} mg/dL")
+        with morioka_tb3:
+            st.metric("TB 交換輸血", f"{morioka['tb']['exchange']} mg/dL")
+        st.markdown(f"UB（µg/dL） low/high/交換輸血: **{morioka['ub']['low']}/{morioka['ub']['high']}/{morioka['ub']['exchange']}**")
+
+if days_old == 0:
+    st.info("日齢0のため、神戸大学（森岡）の基準を参照してください。")
+
+st.markdown("### 📈 村田・井村の基準")
+
+if phototherapy_category is None:
+    st.markdown("適用基準ライン: **体重未測定のため判定不可**")
 else:
-    threshold_message = f"💡 今日（日齢{days_old}日）の光線療法基準値: **{phototherapy_threshold} mg/dL**（血清総ビリルビン値）"
+    st.markdown(f"適用基準ライン: **{phototherapy_category}**")
 
-# 核黄疸危険因子の詳細を取得
 risk_factors = []
 if apgar_score_5min <= 3:
     risk_factors.append("5分Apgar≦3")
@@ -765,39 +1638,35 @@ if hemolysis:
 if cns_abnormality:
     risk_factors.append("敗血症を含む中枢神経系の異常徴候")
 
+if is_day0:
+    st.caption("今日は0日目です。0日目は村田・井村の基準値が定義されていません。")
+
 if adjusted:
     risk_factors_str = "、".join(risk_factors)
-    threshold_message += f"\n\n⚠️ 核黄疸危険因子（{risk_factors_str}）により、基準を1段階低く調整しました（元の基準: {original_category} → 適用基準: {phototherapy_category}）"
+    st.caption(f"⚠️ 核黄疸危険因子（{risk_factors_str}）により基準を1段階低く調整（{original_category} → {phototherapy_category}）")
 elif has_kernicterus_risk:
     risk_factors_str = "、".join(risk_factors)
-    threshold_message += f"\n\n⚠️ 核黄疸危険因子（{risk_factors_str}）が確認されていますが、既に最低基準（{phototherapy_category}）を適用しています。"
+    st.caption(f"⚠️ 核黄疸危険因子（{risk_factors_str}）あり（最低基準 {phototherapy_category} を適用）")
 else:
-    threshold_message += f"\n\n✅ 核黄疸危険因子は該当しません。"
+    st.caption("✅ 核黄疸危険因子なし")
 
-st.info(threshold_message)
-
-# グラフの作成
 fig = go.Figure()
 
-# カテゴリーの順序
 category_order = ["≥ 2,500g", "2,000 ~ 2,499g", "1,500 ~ 1,999g", "1,000 ~ 1,499g", "≤ 999g"]
 colors = {
-    "≥ 2,500g": "#1f77b4",  # 青
-    "2,000 ~ 2,499g": "#ff7f0e",  # オレンジ
-    "1,500 ~ 1,999g": "#2ca02c",  # 緑
-    "1,000 ~ 1,499g": "#d62728",  # 赤
-    "≤ 999g": "#9467bd"  # 紫
+    "≥ 2,500g": "#1f77b4",
+    "2,000 ~ 2,499g": "#ff7f0e",
+    "1,500 ~ 1,999g": "#2ca02c",
+    "1,000 ~ 1,499g": "#d62728",
+    "≤ 999g": "#9467bd"
 }
 
-# 各カテゴリーのラインを描画
 for cat in category_order:
-    thresholds = ALL_PHOTOTHERAPY_THRESHOLDS[cat]
-    days = list(range(8))  # 0-7日
+    thresholds = MURATA_PHOTOTHERAPY_THRESHOLDS[cat]
+    days = list(range(1, 8))
     values = [thresholds[d] for d in days]
-    
-    # 本児が該当するラインかどうか
     is_highlighted = (cat == phototherapy_category)
-    
+
     fig.add_trace(go.Scatter(
         x=days,
         y=values,
@@ -810,31 +1679,52 @@ for cat in category_order:
         ),
         marker=dict(
             size=8 if is_highlighted else 6,
-            color=colors[cat]
-        ),
-        hovertemplate=f'<b>{cat}</b><br>日齢: %{{x}}日<br>基準値: %{{y}} mg/dL<extra></extra>'
+            symbol='circle'
+        )
     ))
 
-# 現在の日齢の位置を示す縦線
-fig.add_vline(
-    x=min(days_old, 7),
-    line_dash="dash",
-    line_color="gray",
-    annotation_text=f"今日（日齢{days_old}日）",
-    annotation_position="top"
-)
+if phototherapy_threshold is not None and not is_day0:
+    x_today = 7 if days_old >= 7 else days_old
+    day_label = "7以上" if days_old >= 7 else str(days_old)
+    fig.add_hline(
+        y=phototherapy_threshold,
+        line_dash="dash",
+        line_color=colors[phototherapy_category],
+        line_width=2,
+    )
 
-# 現在の基準値を示す横線（該当カテゴリーのみ）
-fig.add_hline(
-    y=phototherapy_threshold,
-    line_dash="dash",
-    line_color=colors[phototherapy_category],
-    annotation_text=f"基準値: {phototherapy_threshold} mg/dL",
-    annotation_position="right"
-)
+    fig.add_trace(go.Scatter(
+        x=[x_today],
+        y=[phototherapy_threshold],
+        mode="markers",
+        name="今日の基準",
+        marker=dict(
+            size=16,
+            color=colors[phototherapy_category],
+            line=dict(color="white", width=2),
+            symbol="circle",
+        ),
+        showlegend=False,
+        hovertemplate=(
+            f"日齢: {day_label}日<br>TB基準: {phototherapy_threshold} mg/dL<extra></extra>"
+        ),
+    ))
+
+    fig.add_annotation(
+        x=x_today,
+        y=phototherapy_threshold,
+        text=f"今日（日齢{day_label}日）\nTB基準 {phototherapy_threshold} mg/dL",
+        showarrow=True,
+        arrowhead=2,
+        ax=40,
+        ay=-40,
+        font=dict(size=12, color="white"),
+        bgcolor="rgba(0,0,0,0.55)",
+        bordercolor="rgba(255,255,255,0.35)",
+        borderwidth=1,
+    )
 
 fig.update_layout(
-    title="光線療法基準（村田基準）",
     xaxis_title="生後日齢（日）",
     yaxis_title="血清総ビリルビン値（mg/dL）",
     hovermode='x unified',
@@ -847,5 +1737,61 @@ fig.update_layout(
     )
 )
 
+fig.update_xaxes(range=[0.5, 7.5], tickmode="linear", dtick=1)
+
 st.plotly_chart(fig, use_container_width=True)
 
+st.markdown("---")
+st.markdown("### 📊 神戸大学（森岡）の基準")
+if morioka is None:
+    st.info("神戸大学（森岡）の基準は修正週数が22週以上の範囲で参照できます。")
+else:
+    pca_low, pca_high = morioka["pca_group"]
+    if pca_high == float("inf"):
+        pca_label = f"{pca_low}週以上"
+    else:
+        pca_label = f"{pca_low}-{pca_high}週" if pca_low != pca_high else f"{pca_low}週"
+
+    headline = f"修正週数: **{pca_label}** / 出生後時間: **{morioka['time_label']}**（{hours_old:.1f}時間）"
+    subline = "（表のTBは low/high/交換輸血 の順。UBは別途閾値。）"
+
+    # 入力された在胎週数/在胎日数から、経時変化で到達し得る
+    # （修正週数グループ × 出生後時間バケット）の組み合わせを列挙
+    time_buckets = [24, 48, 72, 96, 120, float("inf")]
+    bucket_ranges = [(0, 24), (24, 48), (48, 72), (72, 96), (96, 120), (120, float("inf"))]
+
+    birth_total_days = gestational_weeks * 7 + gestational_days
+
+    def corrected_weeks_at_day(day_int):
+        return int((birth_total_days + int(day_int)) // 7)
+
+    highlight_pairs = set()
+    for b, (h_start, h_end) in zip(time_buckets, bucket_ranges):
+        if h_end == float("inf"):
+            min_day = int(h_start // 24)
+            w0 = corrected_weeks_at_day(min_day)
+            for g in MORIOKA_TB_THRESHOLDS.keys():
+                gl, gh = g
+                if gh == float("inf"):
+                    if gl <= w0:
+                        highlight_pairs.add((g, b))
+                else:
+                    if gh >= w0:
+                        highlight_pairs.add((g, b))
+        else:
+            min_day = int(h_start // 24)
+            max_day = int((h_end - 1e-9) // 24)
+            for d in range(min_day, max_day + 1):
+                g = get_morioka_pca_group_from_weeks(corrected_weeks_at_day(d))
+                if g is not None:
+                    highlight_pairs.add((g, b))
+
+    morioka_table_html = build_morioka_html_table(
+        current_pca_group=(pca_low, pca_high),
+        current_time_bucket_hours=morioka["time_bucket_hours"],
+        highlight_pairs=highlight_pairs,
+    )
+
+    st.markdown(headline)
+    st.caption(subline)
+    st.markdown(morioka_table_html, unsafe_allow_html=True)
