@@ -99,6 +99,11 @@ def load_taikaku_birth_lms(path):
             "femaleFB_w": (sh.cell(r, 16).value, sh.cell(r, 17).value, sh.cell(r, 18).value),
             "femaleSB_w": (sh.cell(r, 22).value, sh.cell(r, 23).value, sh.cell(r, 24).value),
             "birthH": (sh.cell(r, 34).value, sh.cell(r, 35).value, sh.cell(r, 36).value),
+            # 頭囲LMS（Cols 28-30、性別・出生順位に関わらず共通）
+            "maleFB_hc": (sh.cell(r, 28).value, sh.cell(r, 29).value, sh.cell(r, 30).value),
+            "maleSB_hc": (sh.cell(r, 28).value, sh.cell(r, 29).value, sh.cell(r, 30).value),
+            "femaleFB_hc": (sh.cell(r, 28).value, sh.cell(r, 29).value, sh.cell(r, 30).value),
+            "femaleSB_hc": (sh.cell(r, 28).value, sh.cell(r, 29).value, sh.cell(r, 30).value),
         }
 
     return rows
@@ -124,11 +129,14 @@ def get_birth_size_thresholds(taikaku_rows, gender, is_first_child_bool, gestati
 
     if gender == "男児":
         weight_key = "maleFB_w" if is_first_child_bool else "maleSB_w"
+        hc_key = "maleFB_hc" if is_first_child_bool else "maleSB_hc"
     else:
         weight_key = "femaleFB_w" if is_first_child_bool else "femaleSB_w"
+        hc_key = "femaleFB_hc" if is_first_child_bool else "femaleSB_hc"
 
     wL, wM, wS = row[weight_key]
     hL, hM, hS = row["birthH"]
+    hcL, hcM, hcS = row.get(hc_key, (None, None, None))
 
     z10 = -1.281551565545
     z90 = 1.281551565545
@@ -141,8 +149,12 @@ def get_birth_size_thresholds(taikaku_rows, gender, is_first_child_bool, gestati
         "height_p10_cm": lms_to_value(hL, hM, hS, z10),
         "height_p90_cm": lms_to_value(hL, hM, hS, z90),
         "height_minus2sd_cm": lms_to_value(hL, hM, hS, z_minus2),
+        "hc_p10_cm": lms_to_value(hcL, hcM, hcS, z10),
+        "hc_p90_cm": lms_to_value(hcL, hcM, hcS, z90),
+        "hc_minus2sd_cm": lms_to_value(hcL, hcM, hcS, z_minus2),
         "weight_lms": (wL, wM, wS),
         "height_lms": (hL, hM, hS),
+        "hc_lms": (hcL, hcM, hcS),
     }
 
 
@@ -1131,61 +1143,67 @@ with row1[3]:
         step=1
     )
 
-row2 = st.columns([1.8, 1.6, 1.3, 1.1])
+row2 = st.columns([1.5, 1.5, 1.5, 1.5])
 with row2[0]:
-    if "birth_weight_unknown" not in st.session_state:
-        st.session_state.birth_weight_unknown = False
-    if "birth_weight" not in st.session_state:
-        st.session_state.birth_weight = 3000
-
     col_wt, col_wt_unknown = st.columns([3, 1], vertical_alignment="bottom")
     with col_wt:
-        st.number_input(
+        birth_weight = st.number_input(
             "出生体重 (g)",
             min_value=500,
             max_value=6000,
-            value=int(st.session_state.birth_weight),
+            value=3000,
             step=1,
-            key="birth_weight",
         )
     with col_wt_unknown:
-        st.checkbox("未測定", key="birth_weight_unknown")
-with row2[1]:
-    if "birth_length_unknown" not in st.session_state:
-        st.session_state.birth_length_unknown = False
-    if "birth_length" not in st.session_state:
-        st.session_state.birth_length = 50.0
+        birth_weight_unknown = st.checkbox("未測定", key="birth_weight_unknown")
 
+with row2[1]:
     col_len, col_len_unknown = st.columns([3, 1], vertical_alignment="bottom")
     with col_len:
-        st.number_input(
+        birth_length = st.number_input(
             "出生身長 (cm)",
             min_value=20.0,
             max_value=70.0,
-            value=float(st.session_state.birth_length),
+            value=50.0,
             step=0.1,
             format="%.1f",
-            key="birth_length",
         )
     with col_len_unknown:
-        st.checkbox("未測定", key="birth_length_unknown")
+        birth_length_unknown = st.checkbox("未測定", key="birth_length_unknown")
+
 with row2[2]:
+    col_hc, col_hc_unknown = st.columns([3, 1], vertical_alignment="bottom")
+    with col_hc:
+        birth_head_circumference = st.number_input(
+            "出生頭囲 (cm)",
+            min_value=15.0,
+            max_value=45.0,
+            value=33.5,
+            step=0.1,
+            format="%.1f",
+        )
+    with col_hc_unknown:
+        birth_head_circumference_unknown = st.checkbox("未測定", key="birth_head_circumference_unknown")
+
+with row2[3]:
     gender = st.radio(
         "性別",
         ["男児", "女児"],
         horizontal=True,
     )
-with row2[3]:
+
+row2_5 = st.columns([1.5, 1.5, 1.5, 1.5])
+with row2_5[0]:
     is_first_child = st.radio(
-        "初産/経産",
+        "出生順位",
         ["初産", "経産"],
-        horizontal=True
+        horizontal=True,
     )
 
-birth_weight_unknown = bool(st.session_state.birth_weight_unknown)
-birth_weight = None if birth_weight_unknown else float(st.session_state.birth_weight)
-birth_length_unknown = bool(st.session_state.birth_length_unknown)
-birth_length = None if birth_length_unknown else float(st.session_state.birth_length)
+# 値の変換処理
+birth_weight = None if birth_weight_unknown else float(birth_weight)
+birth_length = None if birth_length_unknown else float(birth_length)
+birth_head_circumference = None if birth_head_circumference_unknown else float(birth_head_circumference)
 
 if birth_weight_unknown:
     st.markdown(
@@ -1204,6 +1222,18 @@ if birth_length_unknown:
         """
 <style>
 div[data-testid="stNumberInput"] input[aria-label="出生身長 (cm)"] {
+  opacity: 0.45;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+if birth_head_circumference_unknown:
+    st.markdown(
+        """
+<style>
+div[data-testid="stNumberInput"] input[aria-label="出生頭囲 (cm)"] {
   opacity: 0.45;
 }
 </style>
@@ -1516,8 +1546,31 @@ if birth_thresholds is not None:
             f"身長: **{birth_length:.1f}cm / {h_z_text} / {h_p_text}**"
             f"（-2SD {birth_thresholds['height_minus2sd_cm']:.1f}cm / 10%ile {birth_thresholds['height_p10_cm']:.1f}cm / 90%ile {birth_thresholds['height_p90_cm']:.1f}cm）"
         )
+    
+    if birth_head_circumference is None:
+        if birth_thresholds.get("hc_p10_cm") is not None:
+            st.markdown(
+                "頭囲: **未測定**"
+                f"（-2SD {birth_thresholds['hc_minus2sd_cm']:.1f}cm / 10%ile {birth_thresholds['hc_p10_cm']:.1f}cm / 90%ile {birth_thresholds['hc_p90_cm']:.1f}cm）"
+            )
+    else:
+        hcL, hcM, hcS = birth_thresholds.get("hc_lms", (None, None, None))
+        if hcL is not None and hcM is not None and hcS is not None:
+            hc_z = value_to_lms_z(hcL, hcM, hcS, birth_head_circumference)
+            hc_p = z_to_percentile(hc_z)
+            hc_z_text = "-" if hc_z is None else f"{hc_z:+.2f}SD"
+            hc_p_text = "-" if hc_p is None else f"{hc_p:.1f}%ile"
+            st.markdown(
+                f"頭囲: **{birth_head_circumference:.1f}cm / {hc_z_text} / {hc_p_text}**"
+                f"（-2SD {birth_thresholds['hc_minus2sd_cm']:.1f}cm / 10%ile {birth_thresholds['hc_p10_cm']:.1f}cm / 90%ile {birth_thresholds['hc_p90_cm']:.1f}cm）"
+            )
+        else:
+            st.markdown(
+                f"頭囲: **{birth_head_circumference:.1f}cm** / データ参照値なし"
+            )
+
     if birth_plane_fig is not None:
-        st.plotly_chart(birth_plane_fig, use_container_width=True)
+        st.plotly_chart(birth_plane_fig, width='stretch')
 
 # 推奨事項の表示
 st.subheader("✅ 管理のポイント")
@@ -1530,6 +1583,7 @@ for special in specials:
         if special.get('title') == '💊 ケイツーシロップ12回投与法':
             if birth_date:
                 d0 = birth_date.strftime('%Y/%m/%d')
+
                 d1 = (birth_date + timedelta(days=1)).strftime('%Y/%m/%d')
                 d4 = (birth_date + timedelta(days=4)).strftime('%Y/%m/%d')
                 d11 = (birth_date + timedelta(days=11)).strftime('%Y/%m/%d')
@@ -1537,6 +1591,7 @@ for special in specials:
                 d0 = d1 = d4 = d11 = None
 
             third = special.get('k2_third_to_twelfth')
+           
             b1, b2, b3 = st.columns(3)
             with b1:
                 st.markdown("#### 1回目")
@@ -1555,6 +1610,7 @@ for special in specials:
                 st.caption(f"日齢11（{d11}）以降" if d11 else "日齢11以降")
                 if third:
                     st.markdown(f"- {third}")
+
                 else:
                     st.markdown("- 日齢11以降の最初の水曜から毎週水曜に内服")
 
@@ -1569,7 +1625,7 @@ for special in specials:
             unsafe_allow_html=True
         )
         for item in special.get('items', []):
-            st.markdown(f"<span style='color: gray;'>{item}</span>", unsafe_allow_html=True)
+                       st.markdown(f"<span style='color: gray;'>{item}</span>", unsafe_allow_html=True)
 
 st.markdown("---")
 st.markdown("## 💡 光線療法基準")
@@ -1739,7 +1795,7 @@ fig.update_layout(
 
 fig.update_xaxes(range=[0.5, 7.5], tickmode="linear", dtick=1)
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width='stretch')
 
 st.markdown("---")
 st.markdown("### 📊 神戸大学（森岡）の基準")
@@ -1755,8 +1811,6 @@ else:
     headline = f"修正週数: **{pca_label}** / 出生後時間: **{morioka['time_label']}**（{hours_old:.1f}時間）"
     subline = "（表のTBは low/high/交換輸血 の順。UBは別途閾値。）"
 
-    # 入力された在胎週数/在胎日数から、経時変化で到達し得る
-    # （修正週数グループ × 出生後時間バケット）の組み合わせを列挙
     time_buckets = [24, 48, 72, 96, 120, float("inf")]
     bucket_ranges = [(0, 24), (24, 48), (48, 72), (72, 96), (96, 120), (120, float("inf"))]
 
@@ -1786,6 +1840,11 @@ else:
                 if g is not None:
                     highlight_pairs.add((g, b))
 
+    if hours_old < 24:
+        st.info("生後24時間未満のため、神戸大学（森岡）の基準は参考値です。")
+    if corrected_weeks < 22:
+        st.warning("修正週数が22週未満のため、神戸大学（森岡）の基準は参考値です。")
+
     morioka_table_html = build_morioka_html_table(
         current_pca_group=(pca_low, pca_high),
         current_time_bucket_hours=morioka["time_bucket_hours"],
@@ -1795,3 +1854,7 @@ else:
     st.markdown(headline)
     st.caption(subline)
     st.markdown(morioka_table_html, unsafe_allow_html=True)
+
+    # UBの閾値もテキストで表示
+    ub_low, ub_high, ub_ex = MORIOKA_UB_THRESHOLDS[(pca_low, pca_high)]
+    st.markdown(f"**UB（µg/dL） low/high/交換輸血:** {ub_low}/{ub_high}/{ub_ex}")
